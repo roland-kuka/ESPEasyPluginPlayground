@@ -1,0 +1,327 @@
+#ifdef USES_P247
+//#######################################################################################################
+//###################### Plugin 247: Energy (AC) PIMA Serial ############################################
+//#######################################################################################################
+//##################                                               ######################################
+//#######################################################################################################
+
+/*Resources
+ * Based on plugin_077,plugin_044
+ * https://www.copel.com/hpcopel/root/sitearquivos2.nsf/arquivos/etc411_medidor_eletronico_para_medicao_de_energia/$FILE/ETC%204.11%20Medidor%20eletronico%20para%20Medicao%20de%20Energia.pdf
+ * https://github.com/jrbenito/PIMA-node
+*/
+
+/*Pima Packet Description
+ * Serial Number:     Bytes[0-4]; BCD encoded
+ * Size:              Byte[5]:Size; 
+ * Scope:             Byte[6]:Scope; 
+ * Index:             Byte[7]:Index;
+ * Data:              Bytes[8..(5+size)]; BCD encoded
+ * crcH               Byte[(6+size)];
+ * crcL               Byte[(7+size)]
+*/ 
+#include <Arduino.h>
+
+#define PLUGIN_247
+#define PLUGIN_ID_247           247
+#define PLUGIN_NAME_247         "Energy (AC) PIMA Serial [TESTING]"
+#define PLUGIN_VALUENAME1_247   "Active_kWh"        // 0x0A + 0x02
+#define PLUGIN_VALUENAME2_247   "Inductive_kWh"     // 0x0A + 0x07
+#define PLUGIN_VALUENAME3_247   "Capacitative_kWh"  // 0x0A + 0x0C
+#define PLUGIN_VALUENAME4_247   "Reverse_kWh"       // 0x0A + 0x51
+
+#define P247_DEFAULT_BAUD_RATE  2400
+#define P247_PREAMBLE_H         0xAA
+#define P247_PREAMBLE_L         0x55
+#define P247_SCOPE_PWR          0x0A
+#define P247_SCOPE_VOLTAGE      0x0B
+#define P247_SCOPE_ALARM        0x0C
+#define P247_INDEX_ACTIV        0x02
+#define P247_INDEX_REACT_I      0x07
+#define P247_INDEX_REACT_C      0x0C
+#define P247_INDEX_REVERSE      0x51
+#define P247_INDEX_VOLTAGE_A    0x00
+#define P247_INDEX_VOLTAGE_B    0x01
+#define P247_INDEX_VOLTAGE_C    0x02
+#define P247_MAX_PKG_SIZE       20
+#define P247_TIMEOUT            20            //timeout for loop: Serial.available()
+
+// begin struct P247_data_struct
+struct P247_data_struct : public PluginTaskData_base {
+
+//##### start method processSerialData (get a PIMA packet from serial port) #####
+  bool processSerialData() {
+    long t_start = millis();   
+    uint8_t pkgSize = P247_MAX_PKG_SIZE-6;
+    int8_t i = -2;
+    while (Serial.available() > 0) {                    //start serial data loop, read serial data
+      uint8_t c = Serial.read();                        //read 1 byte from serial buffer
+      if ((i < -1) && (c == P247_PREAMBLE_H)) {         //preamble 1st byte; Preamble is 0xAA followed by 0x55
+          i++;
+      }                                         
+      else if ((i < 0) && (c == P247_PREAMBLE_L)) {     //preamble 2nd byte
+          i++;
+      }                                         
+      else if ((i >= 0)) {                              //package data start; SerialNumber[0-4];Size[5];Scope[6];Index[7];Data[size-2],crc[size+6+2]
+        PimaPacket[i] = c; i++;
+        if (i == 6) {                                   //package size arrived, save and check
+          pkgSize = c;
+          if ((pkgSize+i) > P247_MAX_PKG_SIZE) {        //package will be greater than MAX_PKG_SIZE
+          break;}
+        }
+        else if (i >= (pkgSize + 6 + 2)) {              //package arrived, return true
+          return true;
+        }
+        else if (i >= P247_MAX_PKG_SIZE) {              //package is greater than MAX_PKG_SIZE
+          break;
+        }
+      }
+      else {                                            //wait for Preamble, reset i, pkgSize to continue loop
+        i = -2; pkgSize = P247_MAX_PKG_SIZE-6;}
+      long t_diff = timePassedSince(t_start);           //get timing stats
+      if ((t_diff > P247_TIMEOUT)) break;               //timeout to make sure this function does to not block
+    }                                                   //end serial data loop
+  return false;
+  } // end method processSerialData
+
+//##### start method processPacket (extract data from PIMA packet) #####
+  bool processPacket(struct EventStruct *event) {
+    uint16_t crcsum=PimaPacket[(PimaPacket[5]+7)]<<8 | PimaPacket[(PimaPacket[5]+6)];
+    if PCONFIG(1) {
+      if (crc16(PimaPacket) != crcsum) return false; //crc check failed
+    } 
+//Assign PIMA Serial Number
+    int32_t value=0; uint8_t buff[6];
+    for(int i = 0; i < 5; i++) {
+      buff[i] = bcd2dec(PimaPacket[i]);
+      SerialNumber = SerialNumber * 100 + (uint32_t)buff[i];
+    }; SerialNumber = value;
+
+//Assign PIMA data
+    if ((PimaPacket[6] == P247_SCOPE_PWR) || (PimaPacket[6] == P247_SCOPE_VOLTAGE)) {
+      value=0;
+      for(int i = 0; i < (PimaPacket[5]-2); i++) {      //convert BCD to decimal
+        buff[i] = bcd2dec(PimaPacket[(i+8)]); 
+        value = value * 100 + (uint32_t)buff[i];
+      }
+      if (value<=0) return false;                       //do not return 0 values
+      switch (PimaPacket[6]) {                          //power or voltage
+          case P247_SCOPE_PWR: {                        //power
+              switch(PimaPacket[7]) {
+              case P247_INDEX_ACTIV: totalkWh = value; break;
+              case P247_INDEX_REACT_I: totalIkWh = value; break;
+              case P247_INDEX_REACT_C: totalCkWh = value; break;
+              case P247_INDEX_REVERSE: totalRkWh = value; break;
+              default: break;}
+          }
+          case P247_SCOPE_VOLTAGE: {                    //voltage
+              switch (PimaPacket[7]) {
+              case P247_INDEX_VOLTAGE_A: voltageA = value; break;
+              case P247_INDEX_VOLTAGE_B: voltageB = value; break;
+              case P247_INDEX_VOLTAGE_C: voltageC = value; break;
+              default: break;}
+          }
+      default: break;}  
+    } 
+    else if (PimaPacket[6] == P247_SCOPE_ALARM) {        //todo: alarms
+      return false;
+    }
+    else {                                               //undefined scope
+      return false;
+    }
+  return true;                                           //valid packet arrived
+  } // end method processPacket
+
+//##### packet data #####
+  uint8_t PimaPacket[P247_MAX_PKG_SIZE];
+  float SerialNumber = 0; // SerialNumber
+  float totalkWh = 0;     // total kwH
+  float totalCkWh = 0;    // total Capacitative kWh
+  float totalIkWh = 0;    // total Inductive kWh
+  float totalRkWh = 0;    // total Reverse kWh
+  float voltageA = 0;
+  float voltageB = 0;
+  float voltageC = 0; 
+  
+ //##### stats data #####
+
+}; // end P247_data_struct
+
+//helper functions
+bool PacketReceived(struct EventStruct *event) {
+//get struct from PluginTaskData for this TaskIndex
+  P247_data_struct* P247_data = static_cast<P247_data_struct*>(getPluginTaskData(event->TaskIndex));
+  if (nullptr == P247_data) return false;
+  if (!P247_data->processPacket(event)) return false;
+  return true;
+}
+
+uint8_t bcd2dec(uint8_t n) {
+  return n - 6 * (n >> 4);
+}
+
+uint16_t crc16(const unsigned char* buff)
+{
+  uint16_t result = 0x0000;
+  uint8_t size = buff[5]+6;
+  if (size>P247_MAX_PKG_SIZE) return false;
+  for (int8_t i = 0; i < size; ++i) {
+    yield();
+    result ^= buff[i]&0xFF;                     // xor byte into lsb of crc
+    for (size_t j = 0; j < 8; ++j) {            // loop over each bit in byte
+      if ((result&0x0001) != 0) {               // if the LSB is set
+        result^=0x4003;                         // apply polynomial inversed!
+        result>>=1;                             // shift right
+        result|=0x8000;                         // xor
+      } else {
+      result>>=1;}}}
+//  result=result<<8 | result>>8;
+  return result;
+}
+
+//#############################################################################
+// start PLUGIN_247
+
+boolean Plugin_247(byte function, struct EventStruct *event, String &string) {
+  boolean success = false;
+
+  switch (function) {
+
+  case PLUGIN_DEVICE_ADD: {
+    Device[++deviceCount].Number = PLUGIN_ID_247;
+    Device[deviceCount].VType = SENSOR_TYPE_QUAD;
+    Device[deviceCount].Ports = 0;
+    Device[deviceCount].PullUpOption = false;
+    Device[deviceCount].InverseLogicOption = false;
+    Device[deviceCount].FormulaOption = true;
+    Device[deviceCount].ValueCount = 4;
+    Device[deviceCount].SendDataOption = true;
+    Device[deviceCount].TimerOption = true;
+    Device[deviceCount].TimerOptional = true;
+    Device[deviceCount].GlobalSyncOption = true;
+    break;
+  }
+
+  case PLUGIN_GET_DEVICENAME: {
+    string = F(PLUGIN_NAME_247);
+    break;
+  }
+
+  case PLUGIN_GET_DEVICEVALUENAMES: {
+    strcpy_P(ExtraTaskSettings.TaskDeviceValueNames[0], PSTR(PLUGIN_VALUENAME1_247));
+    strcpy_P(ExtraTaskSettings.TaskDeviceValueNames[1], PSTR(PLUGIN_VALUENAME2_247));
+    strcpy_P(ExtraTaskSettings.TaskDeviceValueNames[2], PSTR(PLUGIN_VALUENAME3_247));
+    strcpy_P(ExtraTaskSettings.TaskDeviceValueNames[3], PSTR(PLUGIN_VALUENAME4_247));
+    break;
+  }
+
+  case PLUGIN_GET_DEVICEGPIONAMES: {
+    // No pins selectable, all hard coded
+    break;
+  }
+
+  case PLUGIN_WEBFORM_LOAD: {
+ /*   { if (!PCONFIG(0)) PCONFIG(0)= P247_DEFAULT_BAUD_RATE;       
+      addFormNumericBox(F("Baud Rate"), F("P247_baud"), PCONFIG(0),300,2400);
+    }
+*/
+    { if (!PCONFIG(0)) PCONFIG(0)=3;
+      int options_idx[3] = {1,2,3};
+      String options_lbl[3] = {"300","1200","2400"};
+      addFormSelector(F("Baud Rate"), F("P247_baud"),3,options_lbl,options_idx,PCONFIG(0));
+    }
+ 
+    addFormCheckBox(F("Check CRC"), F("P247_crc"),PCONFIG(1));
+    success = true;
+    break;
+  }
+
+  case PLUGIN_WEBFORM_SAVE: {
+    PCONFIG(0) = getFormItemInt(F("P247_baud"));
+    PCONFIG(1) = isFormItemChecked(F("P247_crc"));   
+    success = true;
+    break;
+  }
+
+  case PLUGIN_EXIT: {
+    clearPluginTaskData(event->TaskIndex);
+    success = true;
+    break;
+  }
+
+  case PLUGIN_INIT: {
+    initPluginTaskData(event->TaskIndex, new P247_data_struct());
+    Settings.UseSerial = true;      // enable Serial port
+    disableSerialLog();             // disable logging on serial port 
+    switch (PCONFIG(0)) {           // set user defined BaudRate
+      case 1: Settings.BaudRate = 300;break; 
+      case 2: Settings.BaudRate = 1200;break;
+      case 3: Settings.BaudRate = 2400;break; 
+      default: Settings.BaudRate = 2400; 
+    }
+//    Settings.BaudRate = PCONFIG(0); 
+    Serial.flush();
+    Serial.begin(Settings.BaudRate, SERIAL_8N1);
+    success = true;
+    break;
+  }
+
+  /* currently not needed!
+     case PLUGIN_TEN_PER_SECOND:
+        {
+          success = true;
+          break;
+        }
+  */
+
+  case PLUGIN_READ: {
+// Variables set in PLUGIN_SERIAL_IN as soon as there are new values!  
+/*
+    sendData(event);
+    UserVar[event->BaseVarIndex] = P247_data->totalkWh;
+    UserVar[event->BaseVarIndex + 1] = P247_data->totalIkWh;
+    UserVar[event->BaseVarIndex + 2] = P247_data->totalCkWh;
+    UserVar[event->BaseVarIndex + 3] = P247_data->totalRkWh;
+*/
+    success = true;
+    break;
+  }
+
+/*
+  case PLUGIN_WRITE: {   
+    String command = parseString(string, 1);
+    if (command == F("dummyvalueset")) {
+      if (event->Par1 == event->TaskIndex+1) { // make sure that this instance is the target
+        float floatValue=0;
+        if (string2float(parseString(string, 4),floatValue)) {
+          UserVar[event->BaseVarIndex+event->Par2-1]=floatValue;
+          success = true;
+        }
+      }
+    }
+    break;
+  }
+*/
+
+  case PLUGIN_SERIAL_IN: {
+//get struct from PluginTaskData for this TaskIndex
+    P247_data_struct* P247_data = static_cast<P247_data_struct*>(getPluginTaskData(event->TaskIndex));
+    if (nullptr != P247_data) {
+      success = true;
+      if (P247_data->processSerialData()) {      //serial data arrived        
+        if (PacketReceived(event)) {             // packet is valid, immediately update values
+          UserVar[event->BaseVarIndex] = P247_data->totalkWh;
+          UserVar[event->BaseVarIndex+1] = P247_data->totalIkWh;
+          UserVar[event->BaseVarIndex+2] = P247_data->totalCkWh;
+          UserVar[event->BaseVarIndex+3] = P247_data->totalRkWh;
+        }
+      }
+    }
+    break;
+  }
+  }
+  return success;
+}
+
+
+#endif // USES_P247
